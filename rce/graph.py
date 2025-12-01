@@ -55,3 +55,5 @@ def build_trust_matrix(G: nx.Graph) -> np.ndarray:
     row_sums = A.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0.0] = 1.0
     return A / row_sums
+
+#check
