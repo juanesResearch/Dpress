@@ -1,23 +1,21 @@
-"""Self-contained D-PSGD style baseline to avoid cogdl dependency."""
+"""Gossip-style decentralized SGD baseline."""
 
 from __future__ import annotations
 
 import numpy as np
+
+from rce.graph import build_graph
 
 INPUT_DIM = 784
 HIDDEN_DIM = 8
 OUTPUT_DIM = 10
 BATCH_SIZE = 32
 LR = 0.05
-GRAPH_SYNC_INTERVAL = {
-    "ring": 5,
-    "smallworld": 3,
-    "complete": 1,
-}
+
 GRAPH_COMM_FACTOR = {
     "ring": 1.0,
-    "smallworld": 1.5,
-    "complete": 2.5,
+    "smallworld": 1.3,
+    "complete": 2.0,
 }
 
 
@@ -28,6 +26,10 @@ def _init_model(rng):
         "W2": rng.normal(0, 0.2, size=(OUTPUT_DIM, HIDDEN_DIM)),
         "b2": rng.normal(0, 0.2, size=(OUTPUT_DIM,)),
     }
+
+
+def _clone_model(model):
+    return {k: v.copy() for k, v in model.items()}
 
 
 def _forward(model, X):
@@ -52,8 +54,7 @@ def _loss_and_grads(model, X, y_onehot):
     dW1 = dH.T @ X
     db1 = dH.sum(axis=0)
 
-    grads = {"dW1": dW1, "db1": db1, "dW2": dW2, "db2": db2}
-    return loss, grads
+    return loss, {"dW1": dW1, "db1": db1, "dW2": dW2, "db2": db2}
 
 
 def _apply_grads(model, grads, lr):
@@ -68,16 +69,14 @@ def _sample_batch(X, y, rng):
     return X[idx], y[idx]
 
 
-def _average_models(models):
-    avg = {}
-    for key in models[0].keys():
-        stacked = np.stack([m[key] for m in models], axis=0)
-        avg[key] = stacked.mean(axis=0)
-    return avg
-
-
-def _clone_model(model):
-    return {k: v.copy() for k, v in model.items()}
+def _average_pair(model_i, model_j, mix=0.5):
+    new_i = {}
+    new_j = {}
+    for key in model_i.keys():
+        blended = mix * model_i[key] + (1 - mix) * model_j[key]
+        new_i[key] = blended.copy()
+        new_j[key] = blended.copy()
+    return new_i, new_j
 
 
 def _compute_accuracy(model, X, y):
@@ -86,7 +85,7 @@ def _compute_accuracy(model, X, y):
     return float(np.mean(preds == y))
 
 
-def run_dpsgd_baseline(
+def run_gossip_sgd_baseline(
     X,
     y,
     n_agents=10,
@@ -97,9 +96,13 @@ def run_dpsgd_baseline(
     comm_costs=None,
     agent_datasets=None,
 ):
-    """Lightweight NumPy implementation of synchronous D-PSGD."""
+    """Run a lightweight gossip SGD baseline."""
 
     rng = np.random.default_rng(seed)
+    G = build_graph(n_agents, graph_type)
+    edges = list(G.edges())
+    if not edges:
+        edges = [(i, (i + 1) % n_agents) for i in range(n_agents)]
 
     if agent_datasets is not None:
         clients = agent_datasets
@@ -108,13 +111,6 @@ def run_dpsgd_baseline(
         clients = [(X[idx], y[idx]) for idx in data_splits]
 
     models = [_init_model(rng) for _ in range(n_agents)]
-
-    compute_actions = 0
-    communication_events = 0
-    compute_energy = 0.0
-    comm_energy = 0.0
-    sync_interval = GRAPH_SYNC_INTERVAL.get(graph_type, GRAPH_SYNC_INTERVAL["ring"])
-    comm_factor = GRAPH_COMM_FACTOR.get(graph_type, 1.0)
 
     if compute_costs is None:
         compute_costs = np.full(n_agents, 0.1)
@@ -126,6 +122,12 @@ def run_dpsgd_baseline(
     else:
         comm_costs = np.asarray(comm_costs, dtype=float)
 
+    compute_actions = 0
+    communication_events = 0.0
+    compute_energy = 0.0
+    comm_energy = 0.0
+    comm_factor = GRAPH_COMM_FACTOR.get(graph_type, 1.0)
+
     for step in range(T):
         for i, (Xi, yi) in enumerate(clients):
             Xb, yb = _sample_batch(Xi, yi, rng)
@@ -135,14 +137,22 @@ def run_dpsgd_baseline(
             compute_actions += 1
         compute_energy += compute_costs.sum()
 
-        if (step + 1) % sync_interval == 0:
-            avg_model = _average_models(models)
-            models = [_clone_model(avg_model) for _ in range(n_agents)]
-            event_cost = comm_factor * comm_costs.sum()
-            comm_energy += event_cost
-            communication_events += n_agents
+        n_pairs = max(1, len(edges) // 2)
+        selected = rng.choice(len(edges), size=n_pairs, replace=False)
+        for idx in selected:
+            a, b = edges[idx]
+            new_a, new_b = _average_pair(models[a], models[b], mix=0.5)
+            models[a] = new_a
+            models[b] = new_b
+            comm_energy += comm_factor * (comm_costs[a] + comm_costs[b])
+            communication_events += 2
 
-    global_model = _average_models(models)
+    global_model = _clone_model(models[0])
+    for idx in range(1, n_agents):
+        for key in global_model.keys():
+            global_model[key] += models[idx][key]
+    for key in global_model.keys():
+        global_model[key] /= n_agents
 
     eval_idx = rng.choice(len(X), size=min(2000, len(X)), replace=False)
     final_accuracy = _compute_accuracy(global_model, X[eval_idx], y[eval_idx])

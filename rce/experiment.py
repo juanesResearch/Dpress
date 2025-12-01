@@ -80,6 +80,21 @@ def run_experiment(cfg: RCEConfig):
     mean_credit[0] = c.mean()
     var_credit[0] = c.var()
 
+    if cfg.compute_energy_costs is not None:
+        compute_costs = np.asarray(cfg.compute_energy_costs, dtype=float)
+    else:
+        compute_costs = np.full(n, 0.1)
+
+    if cfg.comm_energy_costs is not None:
+        comm_costs = np.asarray(cfg.comm_energy_costs, dtype=float)
+    else:
+        comm_costs = np.full(n, 0.01)
+
+    if cfg.rest_energy_costs is not None:
+        rest_costs = np.asarray(cfg.rest_energy_costs, dtype=float)
+    else:
+        rest_costs = np.full(n, 0.02)
+
     for t in range(T):
         states = build_states(c, u, e, neighbors)
         actions, action_probs = select_actions(policy_params, states, cfg, rng)
@@ -117,22 +132,13 @@ def run_experiment(cfg: RCEConfig):
         comm_used[t] = np.sum(actions == 1)
 
         # Per-action energy cost model
-        compute_energy_cost = 0.1
-        comm_energy_cost = 0.01
-        rest_energy_cost = 0.02
-
-        step_energy = (
-            compute_energy_cost * np.sum(actions == 0)
-            + comm_energy_cost * np.sum(actions == 1)
-            + rest_energy_cost * np.sum(actions == 2)
+        per_agent_energy = (
+            (actions == 0) * compute_costs
+            + (actions == 1) * comm_costs
+            + (actions == 2) * rest_costs
         )
-        energy_used[t] = step_energy
-
-        energy_per_agent += (
-            (actions == 0) * compute_energy_cost
-            + (actions == 1) * comm_energy_cost
-            + (actions == 2) * rest_energy_cost
-        )
+        energy_per_agent += per_agent_energy
+        energy_used[t] = per_agent_energy.sum()
 
         if not forced_comm:
             policy_params = update_policies(policy_params, states, actions, rewards, cfg)

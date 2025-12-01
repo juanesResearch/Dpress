@@ -26,3 +26,8 @@ class RCEConfig:
 
     # Force full communication every N steps to improve synchronization
     force_comm_every: Optional[int] = None
+
+    # Optional per-agent energy multipliers
+    compute_energy_costs: Optional[list[float]] = None
+    comm_energy_costs: Optional[list[float]] = None
+    rest_energy_costs: Optional[list[float]] = None

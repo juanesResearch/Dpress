@@ -3,8 +3,9 @@ import numpy as np
 from dataclasses import replace
 
 from dpsgd import run_dpsgd_baseline
+from gossip import run_gossip_sgd_baseline
 from rce.config import RCEConfig
-from rce.data import compute_accuracy, load_mnist_numpy
+from rce.data import build_agent_datasets, compute_accuracy, load_mnist_numpy
 from rce.experiment import run_experiment
 from rce.plotting import (
     credit_conservation_report,
@@ -18,7 +19,7 @@ from rce.plotting import (
 ENSEMBLE_TEMPERATURE = 0.2
 
 # Periodically force a full communication round to keep models synchronized.
-FORCE_COMM_INTERVAL = None
+FORCE_COMM_INTERVAL = 40
 
 
 def utility_weighted_average(agent_models, utilities, temperature: float = 1.0):
@@ -126,6 +127,14 @@ def run_multi_graph_experiments(
             )
             logs = run_experiment(cfg_variant)
             ensemble_info = evaluate_rce_ensemble(logs, X, y, temperature=ensemble_temp)
+
+            baseline_rng = np.random.default_rng(cfg_variant.seed + 4242)
+            baseline_datasets = build_agent_datasets(
+                X,
+                y,
+                cfg_variant.n_agents,
+                baseline_rng,
+            )
             dpsgd_metrics = run_dpsgd_baseline(
                 X,
                 y,
@@ -133,6 +142,20 @@ def run_multi_graph_experiments(
                 cfg_variant.T,
                 graph_type=graph_type,
                 seed=cfg_variant.seed,
+                compute_costs=cfg_variant.compute_energy_costs,
+                comm_costs=cfg_variant.comm_energy_costs,
+                agent_datasets=baseline_datasets,
+            )
+            gossip_metrics = run_gossip_sgd_baseline(
+                X,
+                y,
+                cfg_variant.n_agents,
+                cfg_variant.T,
+                graph_type=graph_type,
+                seed=cfg_variant.seed,
+                compute_costs=cfg_variant.compute_energy_costs,
+                comm_costs=cfg_variant.comm_energy_costs,
+                agent_datasets=baseline_datasets,
             )
 
             metrics = {
@@ -153,6 +176,7 @@ def run_multi_graph_experiments(
                     "metrics": metrics,
                     "dpsgd": dpsgd_metrics,
                     "seed": cfg_variant.seed,
+                    "gossip": gossip_metrics,
                 }
             )
 
@@ -162,6 +186,7 @@ def run_multi_graph_experiments(
                     "cfg": cfg_variant,
                     "ensemble": ensemble_info,
                     "dpsgd": dpsgd_metrics,
+                    "gossip": gossip_metrics,
                     "scenario": scenario["name"],
                     "graph": graph_type,
                 }
@@ -175,8 +200,10 @@ def summarize_multi_graph_results(results):
 
     print("\n===== MULTI-GRAPH RCE vs D-PSGD =====")
     header = (
-        f"{'Scenario':<16}{'Graph':<12}{'RCE Acc':>10}{'D Acc':>10}{'ΔAcc':>10}"
-        f"{'RCE Energy':>12}{'D Energy':>12}{'ΔEnergy':>12}{'RCE ACC/E':>12}{'D ACC/E':>12}{'Ens Acc':>10}"
+        f"{'Scenario':<16}{'Graph':<12}{'RCE Acc':>10}{'D Acc':>10}{'G Acc':>10}"
+        f"{'ΔR-D':>10}{'ΔR-G':>10}"
+        f"{'RCE Energy':>12}{'D Energy':>12}{'G Energy':>12}"
+        f"{'RCE ACC/E':>12}{'D ACC/E':>12}{'G ACC/E':>12}{'Ens Acc':>10}"
     )
     print(header)
     print("-" * len(header))
@@ -184,13 +211,16 @@ def summarize_multi_graph_results(results):
     for row in results:
         r = row["metrics"]
         d = row["dpsgd"]
-        acc_delta = r["final_accuracy"] - d["final_accuracy"]
-        energy_delta = r["total_energy"] - d["total_energy"]
+        g = row.get("gossip", {})
+        acc_delta_d = r["final_accuracy"] - d["final_accuracy"]
+        acc_delta_g = r["final_accuracy"] - g.get("final_accuracy", float('nan'))
+        energy_delta_d = r["total_energy"] - d["total_energy"]
         print(
             f"{row['scenario']:<16}{row['graph']:<12}"
-            f"{r['final_accuracy']:>10.4f}{d['final_accuracy']:>10.4f}{acc_delta:>10.4f}"
-            f"{r['total_energy']:>12.1f}{d['total_energy']:>12.1f}{energy_delta:>12.1f}"
-            f"{r['acc_per_energy']:>12.6f}{d['acc_per_energy']:>12.6f}"
+            f"{r['final_accuracy']:>10.4f}{d['final_accuracy']:>10.4f}{g.get('final_accuracy', float('nan')):>10.4f}"
+            f"{acc_delta_d:>10.4f}{acc_delta_g:>10.4f}"
+            f"{r['total_energy']:>12.1f}{d['total_energy']:>12.1f}{g.get('total_energy', float('nan')):>12.1f}"
+            f"{r['acc_per_energy']:>12.6f}{d['acc_per_energy']:>12.6f}{g.get('acc_per_energy', float('nan')):>12.6f}"
             f"{r['ensemble_accuracy']:>10.4f}"
         )
 
@@ -198,6 +228,10 @@ def summarize_multi_graph_results(results):
 
 
 def main():
+    base_compute_costs = [0.08, 0.08, 0.09, 0.09, 0.1, 0.1, 0.11, 0.11, 0.12, 0.12]
+    base_comm_costs = [0.008, 0.008, 0.009, 0.009, 0.01, 0.01, 0.011, 0.011, 0.012, 0.012]
+    base_rest_costs = [0.015, 0.015, 0.017, 0.017, 0.02, 0.02, 0.022, 0.022, 0.025, 0.025]
+
     base_cfg = RCEConfig(
         n_agents=10,
         graph_type="ring",
@@ -211,6 +245,9 @@ def main():
         lr_policy=0.025,
         extinction_enabled=False,
         force_comm_every=FORCE_COMM_INTERVAL,
+        compute_energy_costs=base_compute_costs,
+        comm_energy_costs=base_comm_costs,
+        rest_energy_costs=base_rest_costs,
     )
 
     X_mnist, y_mnist = load_mnist_numpy()
