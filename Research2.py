@@ -18,7 +18,7 @@ from rce.plotting import (
 ENSEMBLE_TEMPERATURE = 0.2
 
 # Periodically force a full communication round to keep models synchronized.
-FORCE_COMM_INTERVAL = 400
+FORCE_COMM_INTERVAL = None
 
 
 def utility_weighted_average(agent_models, utilities, temperature: float = 1.0):
