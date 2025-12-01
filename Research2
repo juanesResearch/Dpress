@@ -1,0 +1,846 @@
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+
+from sklearn.datasets import fetch_openml
+
+
+class RCEConfig:
+    def __init__(
+        self,
+        n_agents=10,
+        graph_type="ring",
+        T=500,
+        gamma=0.2,         # credit exchange rate γ
+        lambda_reg=0.0,    # regeneration λ (0.0 for pure diffusion)
+        alpha_decay=0.0,   # decay α (0.0 for pure diffusion)
+        eps=1e-8,
+        seed=42,
+        # RL params
+        n_actions=3,       # 0=compute, 1=communicate, 2=rest
+        lr_policy=0.01,
+        # extinction flags (disabled for now)
+        extinction_enabled=False,
+    ):
+        self.n_agents = n_agents
+        self.graph_type = graph_type
+        self.T = T
+        self.gamma = gamma
+        self.lambda_reg = lambda_reg
+        self.alpha_decay = alpha_decay
+        self.eps = eps
+        self.seed = seed
+
+        # RL
+        self.n_actions = n_actions
+        self.lr_policy = lr_policy
+
+        # B (extinction) is present in design but OFF
+        self.extinction_enabled = extinction_enabled
+
+
+# ---------- Graph & Trust Matrix ----------
+
+def build_graph(n, graph_type="ring"):
+    if graph_type == "ring":
+        G = nx.cycle_graph(n)
+    elif graph_type == "complete":
+        G = nx.complete_graph(n)
+    elif graph_type == "smallworld":
+        G = nx.watts_strogatz_graph(n, k=4, p=0.2)
+    elif graph_type == "scale-free":
+        G = nx.barabasi_albert_graph(n, m=2)
+    else:
+        raise ValueError(f"Unknown graph_type: {graph_type}")
+    return G
+
+
+def sinkhorn_knopp_doubly_stochastic(A, max_iter=1000, tol=1e-9):
+    """
+    Approximate a doubly-stochastic matrix with Sinkhorn-Knopp.
+    A must be nonnegative and supported on the graph edges.
+    """
+    W = A.astype(float)
+    for _ in range(max_iter):
+        # normalize rows
+        row_sums = W.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0.0] = 1.0
+        W /= row_sums
+
+        # normalize columns
+        col_sums = W.sum(axis=0, keepdims=True)
+        col_sums[col_sums == 0.0] = 1.0
+        W /= col_sums
+
+        if np.allclose(W.sum(axis=1), 1.0, atol=tol) and np.allclose(
+            W.sum(axis=0), 1.0, atol=tol
+        ):
+            break
+    return W
+
+
+def build_trust_matrix(G):
+    """
+    Build trust matrix W aligned with the graph (self + neighbors),
+    approximately doubly-stochastic.
+    """
+    n = G.number_of_nodes()
+    A = np.zeros((n, n), dtype=float)
+
+    # base weights: 1 on self, 1 on neighbors
+    for i in range(n):
+        A[i, i] = 1.0
+        for j in G.neighbors(i):
+            A[i, j] = 1.0
+
+    W = sinkhorn_knopp_doubly_stochastic(A)
+    return W
+
+
+# ---------- Initialization ----------
+
+def initialize_states(cfg: RCEConfig):
+    rng = np.random.default_rng(cfg.seed)
+    n = cfg.n_agents
+
+    # Initial credits: positive, heterogeneous
+    c0 = rng.uniform(low=0.5, high=1.5, size=n)
+
+    # Utilities: [0, 1]
+    u0 = rng.uniform(low=0.0, high=1.0, size=n)
+
+    # Energy costs: [0, 1]
+    e0 = rng.uniform(low=0.0, high=1.0, size=n)
+
+    return c0, u0, e0
+
+
+
+
+# ---------- RL Policy (E) ----------
+
+def softmax(x):
+    x = x - np.max(x)
+    ex = np.exp(x)
+    return ex / (ex.sum() + 1e-12)
+
+
+def init_policies(cfg: RCEConfig):
+    """
+    Policy parameters per agent:
+      - state dimension = 3 + n_agents
+      - n_actions = cfg.n_actions
+      - each agent has W_i of shape (n_actions, state_dim)
+    """
+    n = cfg.n_agents
+    state_dim = 3 + n  # [c_i, u_i, e_i, u_neighbors_masked...]
+    n_actions = cfg.n_actions
+
+    rng = np.random.default_rng(cfg.seed + 1)
+    # small random init
+    policy_params = rng.normal(loc=0.0, scale=0.01, size=(n, n_actions, state_dim))
+    return policy_params, state_dim
+
+
+def build_states(c, u, e, neighbors):
+    """
+    Build state vectors for each agent:
+        state_i = [c_i, u_i, e_i, u_neighbors...]
+    where u_neighbors[j] = u_j if j in N(i), else 0.
+    Shape: (n_agents, 3 + n_agents)
+    """
+    n = len(c)
+    states = np.zeros((n, 3 + n), dtype=float)
+    for i in range(n):
+        s = np.zeros(3 + n, dtype=float)
+        s[0] = c[i]
+        s[1] = u[i]
+        s[2] = e[i]
+        for j in neighbors[i]:
+            s[3 + j] = u[j]
+        states[i] = s
+    return states
+
+
+def select_actions(policy_params, states, cfg: RCEConfig, rng):
+    """
+    For each agent i:
+        logits_i = W_i @ state_i
+        probs_i  = softmax(logits_i)
+        action_i ~ Categorical(probs_i)
+    """
+    n = cfg.n_agents
+    n_actions = cfg.n_actions
+
+    actions = np.zeros(n, dtype=int)
+    action_probs = np.zeros((n, n_actions), dtype=float)
+
+    for i in range(n):
+        logits = policy_params[i] @ states[i]  # shape (n_actions,)
+        probs = softmax(logits)
+        action = rng.choice(n_actions, p=probs)
+
+        actions[i] = action
+        action_probs[i] = probs
+
+    return actions, action_probs
+
+
+def update_policies(policy_params, states, actions, rewards, cfg: RCEConfig):
+    """
+    REINFORCE update:
+        ∇_θ log π(a|s) = (one_hot(a) - probs) ⊗ s
+        θ <- θ + lr * reward * ∇_θ log π
+    No baseline for now (simple).
+    """
+    n = cfg.n_agents
+    n_actions = cfg.n_actions
+    lr = cfg.lr_policy
+
+    for i in range(n):
+        s = states[i]
+        logits = policy_params[i] @ s
+        probs = softmax(logits)
+        a = actions[i]
+        r = rewards[i]  # advantage ≈ reward (no baseline)
+
+        one_hot = np.zeros(n_actions, dtype=float)
+        one_hot[a] = 1.0
+
+        # grad shape: (n_actions, state_dim)
+        grad = (one_hot - probs)[:, None] * s[None, :]
+
+        policy_params[i] += lr * r * grad
+
+    return policy_params
+
+
+# ---------- Dynamics: utilities, energy, flows, reward ----------
+
+def update_utilities(u, t, cfg: RCEConfig, rng):
+    """
+    Basic random-walk utility. Later Step C will replace this
+    with relational utility from reward and trust.
+    """
+    noise = rng.normal(loc=0.0, scale=0.02, size=u.shape)
+    u_new = u + noise
+    u_new = np.clip(u_new, 0.0, 1.0)
+    return u_new
+
+
+def update_energy_costs(e, t, cfg: RCEConfig, rng):
+    noise = rng.normal(loc=0.0, scale=0.02, size=e.shape)
+    e_new = e + noise
+    e_new = np.clip(e_new, 0.0, 1.0)
+    return e_new
+
+
+def apply_action_effects(u, e, actions):
+    """
+    Simple action effects:
+
+      0 = compute:
+          u += 0.10, e += 0.10
+
+      1 = communicate:
+          u += 0.05, e += 0.05
+
+      2 = rest:
+          u -= 0.02, e -= 0.10
+    """
+    u_new = u.copy()
+    e_new = e.copy()
+
+    for i, a in enumerate(actions):
+        if a == 0:  # compute
+            u_new[i] += 0.10
+            e_new[i] += 0.10
+        elif a == 1:  # communicate
+            u_new[i] += 0.05
+            e_new[i] += 0.05
+        elif a == 2:  # rest
+            u_new[i] -= 0.02
+            e_new[i] -= 0.10
+
+    u_new = np.clip(u_new, 0.0, 1.0)
+    e_new = np.clip(e_new, 0.0, 1.0)
+    return u_new, e_new
+
+
+def compute_flows(c, u, W, neighbors, cfg: RCEConfig):
+    n = len(c)
+    gamma = cfg.gamma
+    eps = cfg.eps
+
+    denom = np.zeros(n)
+    for i in range(n):
+        acc = 0.0
+        for k in neighbors[i]:
+            if u[k] > 0:
+                acc += u[k] * W[i, k]
+        denom[i] = acc + eps
+
+    delta = np.zeros((n, n))
+
+    for i in range(n):
+        if c[i] <= 0:
+            continue
+        Zi = denom[i]
+        for j in neighbors[i]:
+            if u[j] <= 0:
+                continue
+            delta[i, j] = gamma * c[i] * (u[j] * W[i, j] / Zi)
+
+    outflow = delta.sum(axis=1)
+    inflow = delta.sum(axis=0)
+    return inflow, outflow, delta
+
+
+
+def compute_reward(u, e):
+    """
+    Simple reward:
+
+        R_i = β u_i - γ_e e_i
+
+    β = 1.0
+    γ_e = 0.3
+    """
+    beta = 1.0
+    gamma_e = 0.3
+    reward = beta * u - gamma_e * e
+    return reward
+
+def compute_relational_utility(r, W, neighbors):
+    """
+    u_i(t) = r_i(t) + sum_{j in N(i)} W_ij * r_j(t)
+    Includes self-term, as required for stable relational utility.
+    """
+    n = len(r)
+    u_new = np.zeros(n, dtype=float)
+    for i in range(n):
+        total = r[i]  # self-term
+        for j in neighbors[i]:
+            total += W[i, j] * r[j]
+        u_new[i] = total
+    return np.clip(u_new, 0.0, 1.0)
+
+
+def update_trust(W, u, neighbors, eta=0.05):
+    """
+    W_ij(t+1) = (1-eta)*W_ij(t) + eta*(u_j / sum_{k in N(i)} u_k)
+    No self-term.
+    Then re-normalize via Sinkhorn.
+    """
+    n = len(u)
+    W_new = np.zeros_like(W)
+
+    for i in range(n):
+        nbrs = neighbors[i]
+        if len(nbrs) == 0:
+            W_new[i, i] = 1.0
+            continue
+
+        u_vals = np.array([u[j] for j in nbrs])
+        total = u_vals.sum()
+
+        if total > 0:
+            target = u_vals / total
+        else:
+            target = np.ones(len(nbrs)) / len(nbrs)
+
+        for idx, j in enumerate(nbrs):
+            W_new[i, j] = (1 - eta) * W[i, j] + eta * target[idx]
+
+        # no self-trust term
+        W_new[i, i] = 0.0
+
+    # make W doubly-stochastic again
+    return sinkhorn_knopp_doubly_stochastic(W_new)
+
+def step_env(c, u, e, W, neighbors, actions,
+             agent_models, agent_datasets,
+             t, cfg: RCEConfig, rng):
+    """
+    NumPy MNIST 1-hidden-layer MLP:
+        input: 784
+        hidden: 8
+        output: 10 classes (softmax)
+    Uses cross-entropy loss.
+    """
+
+    n = len(c)
+    batch_size = 32
+    lr_compute = 0.05
+    lr_comm = 0.05
+
+    # =====================================================
+    # 1) ENERGY UPDATE
+    # =====================================================
+    e_rw = update_energy_costs(e, t, cfg, rng)
+    e_new = e_rw.copy()
+
+    for i, a in enumerate(actions):
+        if a == 0: e_new[i] += 0.10
+        elif a == 1: e_new[i] += 0.05
+        elif a == 2: e_new[i] -= 0.05
+
+    e_new = np.clip(e_new, 0, 1)
+
+    # =====================================================
+    # 2) SAMPLE MNIST BATCH
+    # =====================================================
+    batches_X = []
+    batches_y = []
+    batches_yoh = []
+
+    for i in range(n):
+        Xi, yi = agent_datasets[i]
+        idx_i = rng.choice(len(Xi), size=batch_size, replace=False)
+        Xb = Xi[idx_i]
+        yb = yi[idx_i]
+        batches_X.append(Xb)
+        batches_y.append(yb)
+        batches_yoh.append(np.eye(10)[yb])
+
+    # =====================================================
+    # 3) COMPUTE BASELINE LOSS + GRADIENTS
+    # =====================================================
+    losses_before = np.zeros(n)
+    grads_list = []
+
+    for i in range(n):
+        model = agent_models[i]
+        W1, b1 = model["W1"], model["b1"]
+        W2, b2 = model["W2"], model["b2"]
+
+        Xb = batches_X[i]          # (batch_size, 784)
+        y_onehot = batches_yoh[i]  # (batch_size, 10)
+
+        # forward pass
+        H = Xb @ W1.T + b1
+        H_relu = np.maximum(H, 0)
+
+        logits = H_relu @ W2.T + b2         # (32, 10)
+        logits -= logits.max(axis=1, keepdims=True)
+
+        exp_logits = np.exp(logits)
+        probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+        loss = -np.mean(np.sum(y_onehot * np.log(probs + 1e-9), axis=1))
+        losses_before[i] = loss
+
+        # backward for CE + softmax
+        dlogits = (probs - y_onehot) / batch_size   # (32,10)
+
+        dW2 = dlogits.T @ H_relu      # (10, 8)
+        db2 = dlogits.sum(axis=0)     # (10,)
+
+        dH = dlogits @ W2             # (32,8)
+        dH[H <= 0] = 0                # ReLU derivative
+
+        dW1 = dH.T @ Xb               # (8, 784)
+        db1 = dH.sum(axis=0)          # (8,)
+
+        grads_list.append({
+            "dW1": dW1, "db1": db1,
+            "dW2": dW2, "db2": db2
+        })
+
+
+    # =====================================================
+    # 4) APPLY ACTIONS
+    # =====================================================
+    rewards = np.zeros(n)
+
+    for i in range(n):
+        a = actions[i]
+        g = grads_list[i]
+        model_i = agent_models[i]
+
+        if a == 0:  # COMPUTE
+            Xb = batches_X[i]
+            yb = batches_y[i]
+            y_onehot = batches_yoh[i]
+
+            # accuracy BEFORE update
+            H_before = Xb @ model_i["W1"].T + model_i["b1"]
+            H_relu_before = np.maximum(H_before, 0)
+            logits_before = H_relu_before @ model_i["W2"].T + model_i["b2"]
+            preds_before = np.argmax(logits_before, axis=1)
+            acc_before = np.mean(preds_before == yb)
+
+            # GRADIENT UPDATE
+            model_i["W1"] -= lr_compute * g["dW1"]
+            model_i["b1"] -= lr_compute * g["db1"]
+            model_i["W2"] -= lr_compute * g["dW2"]
+            model_i["b2"] -= lr_compute * g["db2"]
+
+            # accuracy AFTER update
+            H_after = Xb @ model_i["W1"].T + model_i["b1"]
+            H_relu_after = np.maximum(H_after, 0)
+            logits_after = H_relu_after @ model_i["W2"].T + model_i["b2"]
+            preds_after = np.argmax(logits_after, axis=1)
+            acc_after = np.mean(preds_after == yb)
+
+            # reward = accuracy gain
+            rewards[i] = max(0.0, acc_after - acc_before)
+
+
+
+        elif a == 1:  # COMMUNICATE
+            for j in neighbors[i]:
+                mj = agent_models[j]
+
+                # backup neighbor j's params
+                W1_old = mj["W1"].copy()
+                b1_old = mj["b1"].copy()
+                W2_old = mj["W2"].copy()
+                b2_old = mj["b2"].copy()
+
+                Xb_j = batches_X[j]
+                yb_j = batches_y[j]
+                yoh_j = batches_yoh[j]
+
+                # accuracy BEFORE applying i's update
+                H_before = Xb_j @ mj["W1"].T + mj["b1"]
+                H_relu_before = np.maximum(H_before, 0)
+                logits_before = H_relu_before @ mj["W2"].T + mj["b2"]
+                preds_before = np.argmax(logits_before, axis=1)
+                acc_before = np.mean(preds_before == yb_j)
+
+                # hypothetical update on j using i’s gradient
+                mj["W1"] -= lr_comm * g["dW1"]
+                mj["b1"] -= lr_comm * g["db1"]
+                mj["W2"] -= lr_comm * g["dW2"]
+                mj["b2"] -= lr_comm * g["db2"]
+
+                # accuracy AFTER update
+                H_after = Xb_j @ mj["W1"].T + mj["b1"]
+                H_relu_after = np.maximum(H_after, 0)
+                logits_after = H_relu_after @ mj["W2"].T + mj["b2"]
+                preds_after = np.argmax(logits_after, axis=1)
+                acc_after = np.mean(preds_after == yb_j)
+
+                # reward = neighbor accuracy improvement
+                rewards[i] += max(0.0, acc_after - acc_before)
+
+                # restore neighbor j
+                mj["W1"] = W1_old
+                mj["b1"] = b1_old
+                mj["W2"] = W2_old
+                mj["b2"] = b2_old
+
+
+
+        else:  # REST
+            rewards[i] = 0.0
+
+    # normalize reward
+    if rewards.max() > 0:
+        r = rewards / (np.mean(rewards) + 1e-8)
+    else:
+        r = rewards.copy()
+
+    reward_gain = 3.0
+    r = reward_gain * r
+
+    # =====================================================
+    # 5) UTILITY + TRUST + CREDIT
+    # =====================================================
+    u_rel = compute_relational_utility(r, W, neighbors)
+    W = update_trust(W, u_rel, neighbors, eta=0.2)
+    inflow, outflow, delta = compute_flows(c, u_rel, W, neighbors, cfg)
+
+    if cfg.alpha_decay > 0:
+        r_regen = cfg.lambda_reg * (1 - e_new)
+        c_next = (1 - cfg.alpha_decay) * c + inflow - outflow + r_regen
+    else:
+        c_next = c + inflow - outflow
+
+    c_next = np.maximum(c_next, 0)
+
+    return c_next, u_rel, e_new, inflow, outflow, delta, r, W, agent_models
+
+# ---------- Main Experiment Loop ----------
+
+def load_mnist_numpy():
+    from sklearn.datasets import fetch_openml
+    import numpy as np
+
+    mnist = fetch_openml("mnist_784", version=1, as_frame=False)
+    X = mnist.data.astype(np.float32) / 255.0   # normalize to [0,1]
+    y = mnist.target.astype(int)
+
+    return X, y
+
+def compute_accuracy(model, X, y):
+    # forward pass
+    H = X @ model["W1"].T + model["b1"]
+    H_relu = np.maximum(H, 0)
+    logits = H_relu @ model["W2"].T + model["b2"]
+
+    preds = np.argmax(logits, axis=1)
+    return np.mean(preds == y)
+
+def run_experiment(cfg: RCEConfig):
+    # Build graph + trust
+    G = build_graph(cfg.n_agents, cfg.graph_type)
+    W = build_trust_matrix(G)
+    neighbors = {i: list(G.neighbors(i)) for i in range(cfg.n_agents)}
+
+    rng = np.random.default_rng(cfg.seed)
+    c, u, e = initialize_states(cfg)
+
+    n = cfg.n_agents
+    T = cfg.T
+
+    # ======================================================
+    # 1) LOAD MNIST VIA SKLEARN (No PyTorch!)
+    # ======================================================
+    X_mnist, y_mnist = load_mnist_numpy()
+
+    # ------------------------------------------------------
+    # Build NON-IID agent datasets:
+    #   - each agent i specializes in digit (i % 10)
+    #   - each agent has different total dataset size
+    # ------------------------------------------------------
+    digit_indices = {d: np.where(y_mnist == d)[0] for d in range(10)}
+    for d in range(10):
+        rng.shuffle(digit_indices[d])
+
+    # Power-law style sizes (big → small agents)
+    size_profile = np.array([8000, 6000, 5000, 4000, 3000,
+                             2500, 2000, 1500, 1000, 800], dtype=int)
+    if n > len(size_profile):
+        # if more than 10 agents, reuse the last size
+        size_profile = np.concatenate([
+            size_profile,
+            np.full(n - len(size_profile), size_profile[-1], dtype=int)
+        ])
+    elif n < len(size_profile):
+        size_profile = size_profile[:n]
+
+    all_other_indices = {}
+    for d in range(10):
+        all_other_indices[d] = np.where(y_mnist != d)[0]
+
+    agent_datasets = []
+    for i in range(n):
+        home_digit = i % 10
+        total_size = int(size_profile[i])
+
+        main_size = int(0.7 * total_size)   # 70% from home digit
+        other_size = total_size - main_size # 30% from all other digits
+
+        # sample WITH replacement so we don't worry about exhaustion
+        main_idx = rng.choice(digit_indices[home_digit],
+                              size=main_size, replace=True)
+        other_idx = rng.choice(all_other_indices[home_digit],
+                               size=other_size, replace=True)
+
+        idx_i = np.concatenate([main_idx, other_idx])
+        rng.shuffle(idx_i)
+
+        Xi = X_mnist[idx_i]
+        yi = y_mnist[idx_i]
+
+        agent_datasets.append((Xi, yi))
+
+
+    # ======================================================
+    # 2) INITIALIZE NONLINEAR MODELS (NumPy MLP)
+    # ======================================================
+    input_dim = 784
+    hidden_dim = 8
+    output_dim = 10  # 10 classes
+
+    agent_models = []
+    for _ in range(n):
+        W1 = rng.normal(0, 0.2, size=(hidden_dim, input_dim))
+        b1 = rng.normal(0, 0.2, size=(hidden_dim,))
+        W2 = rng.normal(0, 0.2, size=(output_dim, hidden_dim))
+        b2 = rng.normal(0, 0.2, size=(output_dim,))
+        agent_models.append({"W1": W1, "b1": b1, "W2": W2, "b2": b2})
+
+    agent_models = np.array(agent_models, dtype=object)
+
+    # RL policy
+    policy_params, state_dim = init_policies(cfg)
+
+    # Logging
+    credits_history = np.zeros((T + 1, n))
+    total_credit = np.zeros(T + 1)
+    mean_credit = np.zeros(T + 1)
+    var_credit = np.zeros(T + 1)
+    rewards_history = np.zeros((T, n))
+
+    agent_accuracy = np.zeros((T, n))
+    mean_accuracy = np.zeros(T)
+
+    W_history = np.zeros((T + 1, n, n))
+    W_history[0] = W.copy()
+
+    credits_history[0] = c
+    total_credit[0] = c.sum()
+    mean_credit[0] = c.mean()
+    var_credit[0] = c.var()
+
+    # ======================================================
+    # MAIN LOOP
+    # ======================================================
+    for t in range(T):
+        states = build_states(c, u, e, neighbors)
+        actions, action_probs = select_actions(policy_params, states, cfg, rng)
+
+        c, u, e, inflow, outflow, delta, rewards, W, agent_models = step_env(
+            c, u, e, W, neighbors, actions,
+            agent_models, agent_datasets,
+            t, cfg, rng
+        )
+
+
+        policy_params = update_policies(policy_params, states, actions, rewards, cfg)
+
+        W_history[t + 1] = W.copy()
+
+        # sample a small eval batch
+        eval_idx = rng.choice(len(X_mnist), size=200, replace=False)
+        X_eval = X_mnist[eval_idx]
+        y_eval = y_mnist[eval_idx]
+
+        for i in range(n):
+            agent_accuracy[t, i] = compute_accuracy(agent_models[i], X_eval, y_eval)
+
+        mean_accuracy[t] = agent_accuracy[t].mean()
+        ### >>> END ADD
+
+        credits_history[t + 1] = c
+        total_credit[t + 1] = c.sum()
+        mean_credit[t + 1] = c.mean()
+        var_credit[t + 1] = c.var()
+        rewards_history[t] = rewards
+
+    return {
+        "cfg": cfg,
+        "G": G,
+        "W": W,
+        "neighbors": neighbors,
+        "credits_history": credits_history,
+        "total_credit": total_credit,
+        "mean_credit": mean_credit,
+        "var_credit": var_credit,
+        "rewards_history": rewards_history,
+
+        "agent_accuracy": agent_accuracy,
+        "mean_accuracy": mean_accuracy,
+        "trust_history": W_history,
+
+        "policy_params": policy_params,
+    }
+
+
+# ---------- Plotting & Summary ----------
+
+def plot_results(logs):
+    cfg = logs["cfg"]
+    credits_history = logs["credits_history"]
+    total_credit = logs["total_credit"]
+    rewards_history = logs["rewards_history"]
+
+    T = credits_history.shape[0] - 1
+    n = cfg.n_agents
+    t_axis = np.arange(T + 1)
+
+    # credit trajectories
+    plt.figure(figsize=(10, 6))
+    for i in range(n):
+        plt.plot(t_axis, credits_history[:, i], label=f"Agent {i}")
+    plt.xlabel("Time step")
+    plt.ylabel("Credit c_i(t)")
+    plt.title(f"Credit trajectories (N={n}, graph={cfg.graph_type})")
+    plt.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+
+    # total credit
+    plt.figure(figsize=(8, 4))
+    plt.plot(t_axis, total_credit)
+    plt.xlabel("Time step")
+    plt.ylabel("Total credit")
+    plt.title("Total credit over time")
+    plt.tight_layout()
+
+    # average reward over time
+    plt.figure(figsize=(8, 4))
+    avg_reward = rewards_history.mean(axis=1)
+    plt.plot(np.arange(T), avg_reward)
+    plt.xlabel("Time step")
+    plt.ylabel("Average reward")
+    plt.title("Average reward over time")
+    plt.tight_layout()
+
+    plt.show()
+
+
+def credit_conservation_report(logs):
+    cfg = logs["cfg"]
+    total_credit = logs["total_credit"]
+
+    initial = total_credit[0]
+    final = total_credit[-1]
+    change = final - initial
+    percent_change = (change / initial) * 100.0
+
+    print("========== CREDIT DYNAMICS SUMMARY ==========")
+    print(f"Graph type:           {cfg.graph_type}")
+    print(f"N agents:             {cfg.n_agents}")
+    print(f"T steps:              {cfg.T}")
+    print(f"gamma (exchange):     {cfg.gamma}")
+    print(f"lambda_reg (regen):   {cfg.lambda_reg}")
+    print(f"alpha_decay:          {cfg.alpha_decay}")
+    print("---------------------------------------------")
+    print(f"Initial total credit: {initial:.4f}")
+    print(f"Final total credit:   {final:.4f}")
+    print(f"Absolute change:      {change:.4f}")
+    print(f"Percent change:       {percent_change:.2f}%")
+    print("=============================================")
+
+
+if __name__ == "__main__":
+    cfg = RCEConfig(
+        n_agents=10,
+        graph_type="complete",  # "complete", "smallworld", "scale-free"
+        T=3000,
+        gamma=0.2,
+        lambda_reg=0.0,    # 0.0 for now (pure diffusion)
+        alpha_decay=0.0,   # 0.0 for now
+        eps=1e-8,
+        seed=123,
+        n_actions=3,
+        lr_policy=0.01,
+        extinction_enabled=False,
+    )
+
+    logs = run_experiment(cfg)
+    plt.plot(logs["mean_accuracy"])
+    credit_conservation_report(logs)
+    plot_results(logs)
+
+    import matplotlib.pyplot as plt
+
+    W_hist = logs["trust_history"]
+
+    times = [0, 50, 150, 300, 500]   # choose whatever snapshots you want
+    plt.figure(figsize=(12, 8))
+
+    for i, t in enumerate(times):
+        plt.subplot(1, len(times), i+1)
+        plt.imshow(W_hist[t], vmin=0, vmax=1, cmap="viridis")
+        plt.title(f"W at t={t}")
+        plt.colorbar(fraction=0.046, pad=0.04)
+        plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+        
