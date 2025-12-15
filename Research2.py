@@ -16,10 +16,10 @@ from rce.plotting import (
 )
 
 
-# Lower temperature so ensemble prioritizes high-utility agents.
+# Lower T
 ENSEMBLE_TEMPERATURE = 0.05
 
-# Periodically force a full communication round to keep models synchronized.
+# IF needed forcing actions
 FORCE_COMM_INTERVAL = 5000
 ACCURACY_PLOT_STRIDE = 50
 POLICY_CKPT_PATH = "checkpoints/rce_policy.npy"
