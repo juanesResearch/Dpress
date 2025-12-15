@@ -164,7 +164,6 @@ def step_env(
     e_new = np.clip(e_new, 0, 1)
 
     batches_X = []
-    batches_y = []
     batches_yoh = []
 
     for i in range(n):
@@ -173,7 +172,6 @@ def step_env(
         Xb = Xi[idx_i]
         yb = yi[idx_i]
         batches_X.append(Xb)
-        batches_y.append(yb)
         batches_yoh.append(np.eye(10)[yb])
 
     def batch_accuracy(model, Xb, yb):
@@ -227,9 +225,6 @@ def step_env(
         })
 
     rewards = np.zeros(n)
-    compute_costs = np.full(n, 0.1)
-    comm_costs = np.full(n, 0.02)
-    rest_costs = np.full(n, 0.01)
 
     for i in range(n):
         a = actions[i]
@@ -238,7 +233,6 @@ def step_env(
 
         if a == 0:
             Xb = batches_X[i]
-            yb = batches_y[i]
             y_onehot = batches_yoh[i]
 
             H_before = Xb @ model_i["W1"].T + model_i["b1"]
@@ -249,7 +243,6 @@ def step_env(
             probs = expL / expL.sum(axis=1, keepdims=True)
 
             loss_before = -np.mean(np.sum(y_onehot * np.log(probs + 1e-9), axis=1))
-            acc_before = np.mean(np.argmax(probs, axis=1) == yb)
 
             flat_grad_before = np.concatenate([
                 g["dW1"].ravel(),
@@ -271,30 +264,32 @@ def step_env(
             probs2 = expL2 / expL2.sum(axis=1, keepdims=True)
 
             loss_after = -np.mean(np.sum(y_onehot * np.log(probs2 + 1e-9), axis=1))
-            acc_after = np.mean(np.argmax(probs2, axis=1) == yb)
+            loss_delta = loss_before - loss_after
 
-            acc_gain = max(0.0, acc_after - acc_before)
-            loss_gain = max(0.0, loss_before - loss_after)
+            dlogits_after = (probs2 - y_onehot) / batch_size
+            dW2_after = dlogits_after.T @ H_relu_after
+            db2_after = dlogits_after.sum(axis=0)
+
+            dH_after = dlogits_after @ model_i["W2"]
+            dH_after[H_after <= 0] = 0
+
+            dW1_after = dH_after.T @ Xb
+            db1_after = dH_after.sum(axis=0)
 
             flat_grad_after = np.concatenate([
-                g["dW1"].ravel(),
-                g["db1"].ravel(),
-                g["dW2"].ravel(),
-                g["db2"].ravel(),
+                dW1_after.ravel(),
+                db1_after.ravel(),
+                dW2_after.ravel(),
+                db2_after.ravel(),
             ])
             cos_align = np.dot(flat_grad_before, flat_grad_after)
             norm_before = np.linalg.norm(flat_grad_before)
             norm_after = np.linalg.norm(flat_grad_after)
             cos_align /= (norm_before * norm_after + 1e-9)
-            align_reward = max(0.0, cos_align) * loss_gain
-
-            # Slightly down-weight pure compute so an unproductive local step carries a modest cost.
-            reward = 0.5 * np.tanh(4 * acc_gain) + 0.2 * np.tanh(2 * loss_gain) - 0.03
-            rewards[i] = reward + align_reward
+            rewards[i] = cos_align * loss_delta
 
         elif a == 1:
             Xb = batches_X[i]
-            yb = batches_y[i]
             y_onehot = batches_yoh[i]
             model_i = agent_models[i]
 
@@ -307,7 +302,6 @@ def step_env(
             probs = expL / expL.sum(axis=1, keepdims=True)
 
             loss_before = -np.mean(np.sum(y_onehot * np.log(probs + 1e-9), axis=1))
-            acc_before = np.mean(np.argmax(probs, axis=1) == yb)
 
             g = grads_list[i]
             flat_grad_before = np.concatenate([
@@ -330,36 +324,32 @@ def step_env(
             probs2 = expL2 / expL2.sum(axis=1, keepdims=True)
 
             loss_after = -np.mean(np.sum(y_onehot * np.log(probs2 + 1e-9), axis=1))
-            acc_after = np.mean(np.argmax(probs2, axis=1) == yb)
+            loss_delta = loss_before - loss_after
 
-            acc_gain = max(0.0, acc_after - acc_before)
-            loss_gain = max(0.0, loss_before - loss_after)
-            reward_compute = 0.4 * np.tanh(4 * acc_gain) + 0.15 * np.tanh(2 * loss_gain)
+            dlogits_after = (probs2 - y_onehot) / batch_size
+            dW2_after = dlogits_after.T @ H_relu_after
+            db2_after = dlogits_after.sum(axis=0)
+
+            dH_after = dlogits_after @ model_i["W2"]
+            dH_after[H_after <= 0] = 0
+
+            dW1_after = dH_after.T @ Xb
+            db1_after = dH_after.sum(axis=0)
 
             flat_grad_after = np.concatenate([
-                g["dW1"].ravel(),
-                g["db1"].ravel(),
-                g["dW2"].ravel(),
-                g["db2"].ravel(),
+                dW1_after.ravel(),
+                db1_after.ravel(),
+                dW2_after.ravel(),
+                db2_after.ravel(),
             ])
             cos_align = np.dot(flat_grad_before, flat_grad_after)
             norm_before = np.linalg.norm(flat_grad_before)
             norm_after = np.linalg.norm(flat_grad_after)
             cos_align /= (norm_before * norm_after + 1e-9)
-            align_reward = max(0.0, cos_align) * loss_gain
+            grad_reward = cos_align * loss_delta
 
             nbrs = neighbors[i]
             partners = [i] + nbrs
-
-            neighbor_div = 0.0
-            if nbrs:
-                diffs = []
-                for j in nbrs:
-                    diff = 0.0
-                    for key in model_i.keys():
-                        diff += np.mean((model_i[key] - agent_models[j][key]) ** 2)
-                    diffs.append(diff)
-                neighbor_div = float(np.mean(diffs))
 
             avg_params = {}
             for key in model_i.keys():
@@ -370,22 +360,7 @@ def step_env(
                 for key, value in avg_params.items():
                     agent_models[idx_partner][key] = value.copy()
 
-            div_after = 0.0
-            if nbrs:
-                diffs_after = []
-                for j in nbrs:
-                    diff = 0.0
-                    for key in model_i.keys():
-                        diff += np.mean((model_i[key] - agent_models[j][key]) ** 2)
-                    diffs_after.append(diff)
-                div_after = float(np.mean(diffs_after))
-
-            div_improvement = max(0.0, neighbor_div - div_after)
-            if div_improvement < 1e-3:
-                reward_comm = -comm_costs[i]
-            else:
-                reward_comm = 0.3 * np.tanh(0.5 * div_improvement)
-            rewards[i] = reward_compute + reward_comm + align_reward
+            rewards[i] = grad_reward
 
         else:
             # Temporarily disable rest rewards for testing; previously 0.1 * (1 - e_new[i]).

@@ -20,7 +20,7 @@ def load_cifar10_numpy() -> tuple[np.ndarray, np.ndarray]:
         from tensorflow.keras.datasets import cifar10  # type: ignore
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
-            "TensorFlow is required for CIFAR-10 loading. Install it with 'pip install tensorflow' or switch DATASET_NAME back to 'mnist'."
+            "TensorFlow required'."
         ) from exc
 
     (X_train, y_train), (X_test, y_test) = cifar10.load_data()

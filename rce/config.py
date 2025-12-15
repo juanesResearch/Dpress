@@ -21,10 +21,10 @@ class RCEConfig:
     n_actions: int = 3
     lr_policy: float = 0.01
 
-    # Extinction flag kept for parity with original design
+    # Extinction flag 
     extinction_enabled: bool = False
 
-    # Force full communication every N steps to improve synchronization
+    # Force full comm
     force_comm_every: Optional[int] = None
 
     # Optional per-agent energy multipliers
