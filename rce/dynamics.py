@@ -227,6 +227,9 @@ def step_env(
         })
 
     rewards = np.zeros(n)
+    compute_costs = np.full(n, 0.1)
+    comm_costs = np.full(n, 0.02)
+    rest_costs = np.full(n, 0.01)
 
     for i in range(n):
         a = actions[i]
@@ -248,6 +251,13 @@ def step_env(
             loss_before = -np.mean(np.sum(y_onehot * np.log(probs + 1e-9), axis=1))
             acc_before = np.mean(np.argmax(probs, axis=1) == yb)
 
+            flat_grad_before = np.concatenate([
+                g["dW1"].ravel(),
+                g["db1"].ravel(),
+                g["dW2"].ravel(),
+                g["db2"].ravel(),
+            ])
+
             model_i["W1"] -= lr_compute * g["dW1"]
             model_i["b1"] -= lr_compute * g["db1"]
             model_i["W2"] -= lr_compute * g["dW2"]
@@ -266,58 +276,124 @@ def step_env(
             acc_gain = max(0.0, acc_after - acc_before)
             loss_gain = max(0.0, loss_before - loss_after)
 
-            reward = 0.7 * np.tanh(4 * acc_gain) + 0.3 * np.tanh(2 * loss_gain)
-            rewards[i] = reward
+            flat_grad_after = np.concatenate([
+                g["dW1"].ravel(),
+                g["db1"].ravel(),
+                g["dW2"].ravel(),
+                g["db2"].ravel(),
+            ])
+            cos_align = np.dot(flat_grad_before, flat_grad_after)
+            norm_before = np.linalg.norm(flat_grad_before)
+            norm_after = np.linalg.norm(flat_grad_after)
+            cos_align /= (norm_before * norm_after + 1e-9)
+            align_reward = max(0.0, cos_align) * loss_gain
+
+            # Slightly down-weight pure compute so an unproductive local step carries a modest cost.
+            reward = 0.5 * np.tanh(4 * acc_gain) + 0.2 * np.tanh(2 * loss_gain) - 0.03
+            rewards[i] = reward + align_reward
 
         elif a == 1:
-            nbrs = neighbors[i]
-            if len(nbrs) == 0:
-                rewards[i] = 0.0
-                continue
-
-            weights = np.array([max(W[i, j], 0.0) for j in nbrs], dtype=float)
-            if weights.sum() == 0:
-                weights = np.ones_like(weights) / len(weights)
-            else:
-                weights /= weights.sum()
-
-            self_share = 0.4
-            neighbor_share = 0.6
-            pull_strength = 0.2
-
+            Xb = batches_X[i]
+            yb = batches_y[i]
+            y_onehot = batches_yoh[i]
             model_i = agent_models[i]
-            Xb_i = batches_X[i]
-            yb_i = batches_y[i]
 
-            acc_before = batch_accuracy(model_i, Xb_i, yb_i)
+            # Run a local SGD step (same as compute) so communication never skips learning.
+            H_before = Xb @ model_i["W1"].T + model_i["b1"]
+            H_relu_before = np.maximum(H_before, 0)
+            logits_before = H_relu_before @ model_i["W2"].T + model_i["b2"]
 
-            averaged_params = {}
+            expL = np.exp(logits_before - logits_before.max(axis=1, keepdims=True))
+            probs = expL / expL.sum(axis=1, keepdims=True)
+
+            loss_before = -np.mean(np.sum(y_onehot * np.log(probs + 1e-9), axis=1))
+            acc_before = np.mean(np.argmax(probs, axis=1) == yb)
+
+            g = grads_list[i]
+            flat_grad_before = np.concatenate([
+                g["dW1"].ravel(),
+                g["db1"].ravel(),
+                g["dW2"].ravel(),
+                g["db2"].ravel(),
+            ])
+
+            model_i["W1"] -= lr_comm * g["dW1"]
+            model_i["b1"] -= lr_comm * g["db1"]
+            model_i["W2"] -= lr_comm * g["dW2"]
+            model_i["b2"] -= lr_comm * g["db2"]
+
+            H_after = Xb @ model_i["W1"].T + model_i["b1"]
+            H_relu_after = np.maximum(H_after, 0)
+            logits_after = H_relu_after @ model_i["W2"].T + model_i["b2"]
+
+            expL2 = np.exp(logits_after - logits_after.max(axis=1, keepdims=True))
+            probs2 = expL2 / expL2.sum(axis=1, keepdims=True)
+
+            loss_after = -np.mean(np.sum(y_onehot * np.log(probs2 + 1e-9), axis=1))
+            acc_after = np.mean(np.argmax(probs2, axis=1) == yb)
+
+            acc_gain = max(0.0, acc_after - acc_before)
+            loss_gain = max(0.0, loss_before - loss_after)
+            reward_compute = 0.4 * np.tanh(4 * acc_gain) + 0.15 * np.tanh(2 * loss_gain)
+
+            flat_grad_after = np.concatenate([
+                g["dW1"].ravel(),
+                g["db1"].ravel(),
+                g["dW2"].ravel(),
+                g["db2"].ravel(),
+            ])
+            cos_align = np.dot(flat_grad_before, flat_grad_after)
+            norm_before = np.linalg.norm(flat_grad_before)
+            norm_after = np.linalg.norm(flat_grad_after)
+            cos_align /= (norm_before * norm_after + 1e-9)
+            align_reward = max(0.0, cos_align) * loss_gain
+
+            nbrs = neighbors[i]
+            partners = [i] + nbrs
+
+            neighbor_div = 0.0
+            if nbrs:
+                diffs = []
+                for j in nbrs:
+                    diff = 0.0
+                    for key in model_i.keys():
+                        diff += np.mean((model_i[key] - agent_models[j][key]) ** 2)
+                    diffs.append(diff)
+                neighbor_div = float(np.mean(diffs))
+
+            avg_params = {}
             for key in model_i.keys():
-                agg = self_share * model_i[key]
-                for w_val, j in zip(weights, nbrs):
-                    agg += neighbor_share * w_val * agent_models[j][key]
-                averaged_params[key] = agg
+                stacked = np.stack([agent_models[idx][key] for idx in partners], axis=0)
+                avg_params[key] = stacked.mean(axis=0)
 
-            for key, value in averaged_params.items():
-                model_i[key] = value.copy()
+            for idx_partner in partners:
+                for key, value in avg_params.items():
+                    agent_models[idx_partner][key] = value.copy()
 
-            for j in nbrs:
-                model_j = agent_models[j]
-                for key, value in averaged_params.items():
-                    model_j[key] = (1 - pull_strength) * model_j[key] + pull_strength * value
+            div_after = 0.0
+            if nbrs:
+                diffs_after = []
+                for j in nbrs:
+                    diff = 0.0
+                    for key in model_i.keys():
+                        diff += np.mean((model_i[key] - agent_models[j][key]) ** 2)
+                    diffs_after.append(diff)
+                div_after = float(np.mean(diffs_after))
 
-            acc_after = batch_accuracy(model_i, Xb_i, yb_i)
-            rewards[i] = np.tanh(5.0 * max(0.0, acc_after - acc_before))
+            div_improvement = max(0.0, neighbor_div - div_after)
+            if div_improvement < 1e-3:
+                reward_comm = -comm_costs[i]
+            else:
+                reward_comm = 0.3 * np.tanh(0.5 * div_improvement)
+            rewards[i] = reward_compute + reward_comm + align_reward
 
         else:
-            rewards[i] = 0.1 * (1 - e_new[i])
+            # Temporarily disable rest rewards for testing; previously 0.1 * (1 - e_new[i]).
+            rewards[i] = 0.0
 
-    if rewards.max() > 0:
-        r_raw = rewards / (rewards.max() + 1e-8)
-    else:
-        r_raw = rewards.copy()
-
-    r = np.tanh(3.0 * r_raw)
+    # Preserve relative reward magnitudes while keeping utilities in a healthy band.
+    r = np.tanh(rewards) + 0.2
+    r = np.clip(r, -1.0, 1.0)
 
     u_rel_raw = compute_relational_utility(r, W, neighbors)
     u_rel = 0.5 * u + 0.5 * u_rel_raw

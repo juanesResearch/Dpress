@@ -6,25 +6,31 @@ import numpy as np
 
 from rce.graph import build_graph
 
-INPUT_DIM = 784
-HIDDEN_DIM = 8
-OUTPUT_DIM = 10
+DEFAULT_INPUT_DIM = 784
+DEFAULT_HIDDEN_DIM = 8
+DEFAULT_OUTPUT_DIM = 10
 BATCH_SIZE = 32
 LR = 0.05
 
 GRAPH_COMM_FACTOR = {
     "ring": 1.0,
-    "smallworld": 1.3,
-    "complete": 2.0,
+    "smallworld": 1.2,
+    "complete": 1.4,
+}
+
+GOSSIP_COMM_INTERVAL = {
+    "ring": 5,
+    "smallworld": 3,
+    "complete": 1,
 }
 
 
-def _init_model(rng):
+def _init_model(rng, input_dim, hidden_dim, output_dim):
     return {
-        "W1": rng.normal(0, 0.2, size=(HIDDEN_DIM, INPUT_DIM)),
-        "b1": rng.normal(0, 0.2, size=(HIDDEN_DIM,)),
-        "W2": rng.normal(0, 0.2, size=(OUTPUT_DIM, HIDDEN_DIM)),
-        "b2": rng.normal(0, 0.2, size=(OUTPUT_DIM,)),
+        "W1": rng.normal(0, 0.2, size=(hidden_dim, input_dim)),
+        "b1": rng.normal(0, 0.2, size=(hidden_dim,)),
+        "W2": rng.normal(0, 0.2, size=(output_dim, hidden_dim)),
+        "b2": rng.normal(0, 0.2, size=(output_dim,)),
     }
 
 
@@ -79,6 +85,16 @@ def _average_pair(model_i, model_j, mix=0.5):
     return new_i, new_j
 
 
+def _average_models(models):
+    avg = {k: np.zeros_like(v) for k, v in models[0].items()}
+    for model in models:
+        for key in avg.keys():
+            avg[key] += model[key]
+    for key in avg.keys():
+        avg[key] /= len(models)
+    return avg
+
+
 def _compute_accuracy(model, X, y):
     logits, _ = _forward(model, X)
     preds = np.argmax(logits, axis=1)
@@ -95,8 +111,11 @@ def run_gossip_sgd_baseline(
     compute_costs=None,
     comm_costs=None,
     agent_datasets=None,
+    eval_stride=200,
+    pairs_per_round=1,
+    exclusive_comm_rounds=False,
 ):
-    """Run a lightweight gossip SGD baseline."""
+    """Run a lightweight gossip SGD baseline with configurable pair exchanges."""
 
     rng = np.random.default_rng(seed)
     G = build_graph(n_agents, graph_type)
@@ -110,7 +129,12 @@ def run_gossip_sgd_baseline(
         data_splits = np.array_split(np.arange(len(X)), n_agents)
         clients = [(X[idx], y[idx]) for idx in data_splits]
 
-    models = [_init_model(rng) for _ in range(n_agents)]
+    input_dim = X.shape[1] if X.ndim > 1 else DEFAULT_INPUT_DIM
+    unique_labels = np.unique(y)
+    output_dim = int(unique_labels.size) if unique_labels.size else DEFAULT_OUTPUT_DIM
+    hidden_dim = DEFAULT_HIDDEN_DIM if input_dim <= 1024 else 32
+
+    models = [_init_model(rng, input_dim, hidden_dim, output_dim) for _ in range(n_agents)]
 
     if compute_costs is None:
         compute_costs = np.full(n_agents, 0.1)
@@ -127,32 +151,52 @@ def run_gossip_sgd_baseline(
     compute_energy = 0.0
     comm_energy = 0.0
     comm_factor = GRAPH_COMM_FACTOR.get(graph_type, 1.0)
+    accuracy_history = []
+    comm_counts_history = []
+
+    eval_idx = rng.choice(len(X), size=min(2000, len(X)), replace=False)
+    X_eval = X[eval_idx]
+    y_eval = y[eval_idx]
+
+    pairs_per_round = max(1, int(pairs_per_round))
+    comm_interval = GOSSIP_COMM_INTERVAL.get(graph_type, 1)
+    if exclusive_comm_rounds and comm_interval < 2:
+        comm_interval = 2  # ensure compute and comm alternate instead of being skipped entirely
 
     for step in range(T):
-        for i, (Xi, yi) in enumerate(clients):
-            Xb, yb = _sample_batch(Xi, yi, rng)
-            y_onehot = np.eye(OUTPUT_DIM)[yb]
-            _, grads = _loss_and_grads(models[i], Xb, y_onehot)
-            _apply_grads(models[i], grads, LR)
-            compute_actions += 1
-        compute_energy += compute_costs.sum()
+        step_comm_actions = 0
+        do_comm = (step + 1) % comm_interval == 0
+        skip_compute = exclusive_comm_rounds and do_comm
 
-        n_pairs = max(1, len(edges) // 2)
-        selected = rng.choice(len(edges), size=n_pairs, replace=False)
-        for idx in selected:
-            a, b = edges[idx]
-            new_a, new_b = _average_pair(models[a], models[b], mix=0.5)
-            models[a] = new_a
-            models[b] = new_b
-            comm_energy += comm_factor * (comm_costs[a] + comm_costs[b])
-            communication_events += 2
+        if not skip_compute:
+            for i, (Xi, yi) in enumerate(clients):
+                Xb, yb = _sample_batch(Xi, yi, rng)
+                y_onehot = np.eye(output_dim)[yb.astype(int)]
+                _, grads = _loss_and_grads(models[i], Xb, y_onehot)
+                _apply_grads(models[i], grads, LR)
+                compute_actions += 1
+            compute_energy += compute_costs.sum()
 
-    global_model = _clone_model(models[0])
-    for idx in range(1, n_agents):
-        for key in global_model.keys():
-            global_model[key] += models[idx][key]
-    for key in global_model.keys():
-        global_model[key] /= n_agents
+        if do_comm:
+            n_pairs = min(pairs_per_round, len(edges))
+            selected = rng.choice(len(edges), size=n_pairs, replace=False)
+            for idx in selected:
+                a, b = edges[idx]
+                new_a, new_b = _average_pair(models[a], models[b], mix=0.5)
+                models[a] = new_a
+                models[b] = new_b
+                comm_energy += comm_factor * (comm_costs[a] + comm_costs[b])
+                communication_events += 2
+                step_comm_actions += 2
+
+        comm_counts_history.append(step_comm_actions)
+
+        if (step + 1) % eval_stride == 0 or step == T - 1:
+            avg_model = _average_models(models)
+            acc = _compute_accuracy(avg_model, X_eval, y_eval)
+            accuracy_history.append((step + 1, acc))
+
+    global_model = _average_models(models)
 
     eval_idx = rng.choice(len(X), size=min(2000, len(X)), replace=False)
     final_accuracy = _compute_accuracy(global_model, X[eval_idx], y[eval_idx])
@@ -167,4 +211,6 @@ def run_gossip_sgd_baseline(
         "acc_per_energy": final_accuracy / (total_energy + 1e-9),
         "acc_per_comm": final_accuracy / (communication_events + 1e-9),
         "graph_type": graph_type,
+        "accuracy_history": accuracy_history,
+        "comm_counts_history": comm_counts_history,
     }

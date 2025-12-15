@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from .config import RCEConfig
-from .data import build_agent_datasets, compute_accuracy, load_mnist_numpy
+from .data import build_agent_datasets, compute_accuracy, load_dataset
 from .dynamics import step_env
 from .graph import build_graph, build_trust_matrix
 from .policy import build_states, init_policies, select_actions, update_policies
@@ -31,12 +33,18 @@ def run_experiment(cfg: RCEConfig):
     n = cfg.n_agents
     T = cfg.T
 
-    X_mnist, y_mnist = load_mnist_numpy()
-    agent_datasets = build_agent_datasets(X_mnist, y_mnist, n, rng)
+    X_data, y_data = load_dataset(getattr(cfg, "dataset_name", "mnist"))
+    agent_datasets = build_agent_datasets(X_data, y_data, n, rng)
 
-    input_dim = 784
-    hidden_dim = 8
-    output_dim = 10
+    eval_rng = np.random.default_rng(cfg.seed + 2024)
+    eval_size = min(200, len(X_data))
+    eval_idx = eval_rng.choice(len(X_data), size=eval_size, replace=False)
+    X_eval_fixed = X_data[eval_idx]
+    y_eval_fixed = y_data[eval_idx]
+
+    input_dim = X_data.shape[1]
+    output_dim = int(np.unique(y_data).size)
+    hidden_dim = 8 if input_dim <= 1024 else 32
 
     agent_models = []
     for _ in range(n):
@@ -47,6 +55,12 @@ def run_experiment(cfg: RCEConfig):
         agent_models.append({"W1": W1, "b1": b1, "W2": W2, "b2": b2})
 
     agent_models = np.array(agent_models, dtype=object)
+
+    baseline_acc = [compute_accuracy(model, X_eval_fixed, y_eval_fixed) for model in agent_models]
+    prev_mean_acc = float(np.mean(baseline_acc))
+    acc_trend = 0.0
+    comm_trend = 0.0
+    comm_trace = np.zeros(n, dtype=float)
 
     policy_params, _ = init_policies(cfg)
 
@@ -65,6 +79,7 @@ def run_experiment(cfg: RCEConfig):
 
     compute_used = np.zeros(T)
     comm_used = np.zeros(T)
+    rest_used = np.zeros(T)
     energy_used = np.zeros(T)
     energy_per_agent = np.zeros(n)
 
@@ -98,7 +113,6 @@ def run_experiment(cfg: RCEConfig):
     for t in range(T):
         states = build_states(c, u, e, neighbors)
         actions, action_probs = select_actions(policy_params, states, cfg, rng)
-
         forced_comm = False
         if cfg.force_comm_every:
             interval = int(cfg.force_comm_every)
@@ -130,6 +144,7 @@ def run_experiment(cfg: RCEConfig):
 
         compute_used[t] = np.sum(actions == 0)
         comm_used[t] = np.sum(actions == 1)
+        rest_used[t] = np.sum(actions == 2)
 
         # Per-action energy cost model
         per_agent_energy = (
@@ -140,19 +155,52 @@ def run_experiment(cfg: RCEConfig):
         energy_per_agent += per_agent_energy
         energy_used[t] = per_agent_energy.sum()
 
-        if not forced_comm:
-            policy_params = update_policies(policy_params, states, actions, rewards, cfg)
-
-        W_history[t + 1] = W.copy()
-
-        eval_idx = rng.choice(len(X_mnist), size=200, replace=False)
-        X_eval = X_mnist[eval_idx]
-        y_eval = y_mnist[eval_idx]
-
         for i in range(n):
-            agent_accuracy[t, i] = compute_accuracy(agent_models[i], X_eval, y_eval)
+            agent_accuracy[t, i] = compute_accuracy(agent_models[i], X_eval_fixed, y_eval_fixed)
 
         mean_accuracy[t] = agent_accuracy[t].mean()
+
+        acc_delta = max(0.0, mean_accuracy[t] - prev_mean_acc)
+        prev_mean_acc = mean_accuracy[t]
+        acc_trend = 0.4 * acc_trend + 0.6 * acc_delta
+
+        horizon = max(1, T)
+        phase = max(0.0, 1.0 - (t / horizon))
+        fast_decay = np.exp(-t / max(1.0, 0.2 * horizon))
+        bonus_scale = 0.5 * (phase + fast_decay)
+        bonus = bonus_scale * acc_trend
+
+        comm_rate = comm_used[t] / max(1.0, float(n))
+        comm_trend = 0.9 * comm_trend + 0.1 * comm_rate
+        late_start = 0.75 * horizon
+        late_frac = max(0.0, (t - late_start) / max(1.0, horizon - late_start))
+        late_penalty = 0.02 * comm_trend * late_frac
+
+        trace_decay = 0.6
+        comm_trace = trace_decay * comm_trace + (actions == 1).astype(float)
+
+        if bonus > 0:
+            trace = comm_trace.copy()
+            total_trace = trace.sum()
+            if total_trace > 0:
+                rewards += bonus * (trace / total_trace)
+
+            if late_penalty > 0:
+                comm_mask = actions == 1
+                rewards[comm_mask] -= late_penalty
+
+            compute_mask = actions == 0
+            rewards[compute_mask] -= 0.1 * bonus
+
+        policy_params = update_policies(
+            policy_params,
+            states,
+            actions,
+            rewards,
+            cfg,
+        )
+
+        W_history[t + 1] = W.copy()
 
         credits_history[t + 1] = c
         total_credit[t + 1] = c.sum()
@@ -160,6 +208,12 @@ def run_experiment(cfg: RCEConfig):
         var_credit[t + 1] = c.var()
         utility_history[t + 1] = u
         rewards_history[t] = rewards
+
+    if cfg.policy_save_path:
+        save_path = Path(cfg.policy_save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(save_path, policy_params)
+        print(f"[info] Saved policy parameters to {save_path}")
 
     return {
         "cfg": cfg,
@@ -181,13 +235,16 @@ def run_experiment(cfg: RCEConfig):
         "rest_actions": rest_actions,
         "compute_used": compute_used,
         "comm_used": comm_used,
+        "rest_used": rest_used,
         "energy_used": energy_used,
         "energy_per_agent": energy_per_agent,
         "final_accuracy": mean_accuracy[-1],
         "total_compute": compute_actions.sum(),
         "total_comm": comm_actions.sum(),
+        "total_rest": rest_actions.sum(),
         "total_energy": energy_used.sum(),
         "acc_per_energy": mean_accuracy[-1] / (energy_used.sum() + 1e-9),
         "acc_per_comm": mean_accuracy[-1] / (comm_actions.sum() + 1e-9),
+        "acc_per_rest": mean_accuracy[-1] / (rest_actions.sum() + 1e-9),
         "agent_models": _clone_models(agent_models),
     }

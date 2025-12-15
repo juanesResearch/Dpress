@@ -31,3 +31,12 @@ class RCEConfig:
     compute_energy_costs: Optional[list[float]] = None
     comm_energy_costs: Optional[list[float]] = None
     rest_energy_costs: Optional[list[float]] = None
+
+    # Optional persistence for policy parameters
+    policy_init_path: Optional[str] = None
+    policy_save_path: Optional[str] = None
+
+    # Dataset selection
+    dataset_name: str = "mnist"
+
+

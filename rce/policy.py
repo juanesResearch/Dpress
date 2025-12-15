@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from .config import RCEConfig
@@ -19,6 +21,25 @@ def init_policies(cfg: RCEConfig) -> tuple[np.ndarray, int]:
     n = cfg.n_agents
     state_dim = 3 + n  # [c_i, u_i, e_i, u_neighbors...]
     n_actions = cfg.n_actions
+
+    if cfg.policy_init_path:
+        init_path = Path(cfg.policy_init_path)
+        if init_path.exists():
+            try:
+                loaded = np.load(init_path, allow_pickle=True)
+                loaded = np.asarray(loaded, dtype=float)
+                if loaded.shape == (n, n_actions, state_dim):
+                    print(f"[info] Loaded policy parameters from {init_path}")
+                    return loaded.copy(), state_dim
+                else:
+                    print(
+                        f"[warn] Policy checkpoint shape {loaded.shape} does not match "
+                        f"({n}, {n_actions}, {state_dim}); reinitializing."
+                    )
+            except OSError as exc:
+                print(f"[warn] Failed to load policy checkpoint {init_path}: {exc}")
+        else:
+            print(f"[warn] Policy init path {init_path} not found; sampling new parameters.")
 
     rng = np.random.default_rng(cfg.seed + 1)
     policy_params = rng.normal(loc=0.0, scale=0.01, size=(n, n_actions, state_dim))
@@ -64,6 +85,7 @@ def update_policies(
     actions: np.ndarray,
     rewards: np.ndarray,
     cfg: RCEConfig,
+    update_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """REINFORCE update for each agent policy."""
     n = cfg.n_agents
@@ -71,6 +93,8 @@ def update_policies(
     lr = cfg.lr_policy
 
     for i in range(n):
+        if update_mask is not None and not update_mask[i]:
+            continue
         s = states[i]
         logits = policy_params[i] @ s
         probs = softmax(logits)

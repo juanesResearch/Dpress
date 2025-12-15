@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
+from rce.graph import build_graph
 
-INPUT_DIM = 784
-HIDDEN_DIM = 8
-OUTPUT_DIM = 10
+DEFAULT_INPUT_DIM = 784
+DEFAULT_HIDDEN_DIM = 8
+DEFAULT_OUTPUT_DIM = 10
 BATCH_SIZE = 32
 LR = 0.05
 GRAPH_SYNC_INTERVAL = {
@@ -16,17 +17,17 @@ GRAPH_SYNC_INTERVAL = {
 }
 GRAPH_COMM_FACTOR = {
     "ring": 1.0,
-    "smallworld": 1.5,
-    "complete": 2.5,
+    "smallworld": 1.0,
+    "complete": 1.0,
 }
 
 
-def _init_model(rng):
+def _init_model(rng, input_dim, hidden_dim, output_dim):
     return {
-        "W1": rng.normal(0, 0.2, size=(HIDDEN_DIM, INPUT_DIM)),
-        "b1": rng.normal(0, 0.2, size=(HIDDEN_DIM,)),
-        "W2": rng.normal(0, 0.2, size=(OUTPUT_DIM, HIDDEN_DIM)),
-        "b2": rng.normal(0, 0.2, size=(OUTPUT_DIM,)),
+        "W1": rng.normal(0, 0.2, size=(hidden_dim, input_dim)),
+        "b1": rng.normal(0, 0.2, size=(hidden_dim,)),
+        "W2": rng.normal(0, 0.2, size=(output_dim, hidden_dim)),
+        "b2": rng.normal(0, 0.2, size=(output_dim,)),
     }
 
 
@@ -96,6 +97,8 @@ def run_dpsgd_baseline(
     compute_costs=None,
     comm_costs=None,
     agent_datasets=None,
+    eval_stride=200,
+    exclusive_comm_rounds=False,
 ):
     """Lightweight NumPy implementation of synchronous D-PSGD."""
 
@@ -107,13 +110,38 @@ def run_dpsgd_baseline(
         data_splits = np.array_split(np.arange(len(X)), n_agents)
         clients = [(X[idx], y[idx]) for idx in data_splits]
 
-    models = [_init_model(rng) for _ in range(n_agents)]
+    input_dim = X.shape[1] if X.ndim > 1 else DEFAULT_INPUT_DIM
+    unique_labels = np.unique(y)
+    output_dim = int(unique_labels.size) if unique_labels.size else DEFAULT_OUTPUT_DIM
+    hidden_dim = DEFAULT_HIDDEN_DIM if input_dim <= 1024 else 32
+
+    models = [_init_model(rng, input_dim, hidden_dim, output_dim) for _ in range(n_agents)]
+
+    G = build_graph(n_agents, graph_type)
+    if G.number_of_edges() == 0:
+        for i in range(n_agents):
+            G.add_edge(i, (i + 1) % n_agents)
+
+    neighbors = []
+    for node in range(n_agents):
+        neigh = list(G.neighbors(node))
+        if not neigh:
+            neigh = [node]
+        neighbors.append(neigh)
 
     compute_actions = 0
     communication_events = 0
     compute_energy = 0.0
     comm_energy = 0.0
+    accuracy_history = []
+    comm_counts_history = []
+
+    eval_idx = rng.choice(len(X), size=min(2000, len(X)), replace=False)
+    X_eval = X[eval_idx]
+    y_eval = y[eval_idx]
     sync_interval = GRAPH_SYNC_INTERVAL.get(graph_type, GRAPH_SYNC_INTERVAL["ring"])
+    if exclusive_comm_rounds and sync_interval < 2:
+        sync_interval = 2  # keep at least one pure compute step between comm rounds
     comm_factor = GRAPH_COMM_FACTOR.get(graph_type, 1.0)
 
     if compute_costs is None:
@@ -127,20 +155,45 @@ def run_dpsgd_baseline(
         comm_costs = np.asarray(comm_costs, dtype=float)
 
     for step in range(T):
-        for i, (Xi, yi) in enumerate(clients):
-            Xb, yb = _sample_batch(Xi, yi, rng)
-            y_onehot = np.eye(OUTPUT_DIM)[yb]
-            _, grads = _loss_and_grads(models[i], Xb, y_onehot)
-            _apply_grads(models[i], grads, LR)
-            compute_actions += 1
-        compute_energy += compute_costs.sum()
+        step_comm_actions = 0
+        do_sync = (step + 1) % sync_interval == 0
+        skip_compute = exclusive_comm_rounds and do_sync
 
-        if (step + 1) % sync_interval == 0:
+        if not skip_compute:
+            for i, (Xi, yi) in enumerate(clients):
+                Xb, yb = _sample_batch(Xi, yi, rng)
+                y_onehot = np.eye(output_dim)[yb.astype(int)]
+                _, grads = _loss_and_grads(models[i], Xb, y_onehot)
+                _apply_grads(models[i], grads, LR)
+                compute_actions += 1
+            compute_energy += compute_costs.sum()
+
+        if do_sync:
+            mixed_models = []
+            event_comm_energy = 0.0
+            event_comm_actions = 0
+            for agent_idx in range(n_agents):
+                partner_idxs = [agent_idx] + neighbors[agent_idx]
+                partner_models = [models[idx] for idx in partner_idxs]
+                avg_model = _average_models(partner_models)
+                mixed_models.append(avg_model)
+
+                deg = len(neighbors[agent_idx])
+                agent_comm_cost = comm_factor * comm_costs[agent_idx] * deg
+                event_comm_energy += agent_comm_cost
+                event_comm_actions += deg
+
+            models = [_clone_model(m) for m in mixed_models]
+            comm_energy += event_comm_energy
+            communication_events += event_comm_actions
+            step_comm_actions += event_comm_actions
+
+        comm_counts_history.append(step_comm_actions)
+
+        if (step + 1) % eval_stride == 0 or step == T - 1:
             avg_model = _average_models(models)
-            models = [_clone_model(avg_model) for _ in range(n_agents)]
-            event_cost = comm_factor * comm_costs.sum()
-            comm_energy += event_cost
-            communication_events += n_agents
+            acc = _compute_accuracy(avg_model, X_eval, y_eval)
+            accuracy_history.append((step + 1, acc))
 
     global_model = _average_models(models)
 
@@ -157,4 +210,6 @@ def run_dpsgd_baseline(
         "acc_per_energy": final_accuracy / (total_energy + 1e-9),
         "acc_per_comm": final_accuracy / (communication_events + 1e-9),
         "graph_type": graph_type,
+        "accuracy_history": accuracy_history,
+        "comm_counts_history": comm_counts_history,
     }
